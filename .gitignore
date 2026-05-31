@@ -1,0 +1,24 @@
+.DS_Store
+
+# SwiftPM and build output
+.build/
+Build/
+DerivedData/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local packaged helper copies; canonical sources live under Sources/
+agent/
+
+# Logs and temporary telemetry
+*.log
+*.tmp
+*.pid
+stellarscope-powermetrics.json
+stellarscope-powermetrics-agent.log
+
+# Legacy local notes
+README_v*.md
+README_快速上手.md
