@@ -5,22 +5,31 @@ final class EnvironmentCollector: @unchecked Sendable {
     private let nativeSPU = NativeSPUHIDCollector()
     private var cachedSensors: [SensorMetric] = []
     private var liveSensors: [SensorMetric] = []
+    private var bcgSensors: [SensorMetric] = []
     private var lastRefresh = Date.distantPast
     private var lastLiveRefresh = Date.distantPast
+    private var lastBCGRefresh = Date.distantPast
     private var isRefreshing = false
     private var isLiveRefreshing = false
+    private var isBCGRefreshing = false
 
     func sample(maxAge: TimeInterval = 8.0, liveMaxAge: TimeInterval = 1.0) -> [SensorMetric] {
-        let state = stateQueue.sync { () -> (sensors: [SensorMetric], shouldRefresh: Bool, shouldRefreshLive: Bool) in
+        let bcgEnabled = UserDefaults.standard.bool(forKey: "bcgHeartRateEnabled")
+        let state = stateQueue.sync { () -> (sensors: [SensorMetric], shouldRefresh: Bool, shouldRefreshLive: Bool, shouldRefreshBCG: Bool) in
             let shouldRefresh = !isRefreshing && Date().timeIntervalSince(lastRefresh) > maxAge
             let shouldRefreshLive = !isLiveRefreshing && Date().timeIntervalSince(lastLiveRefresh) > liveMaxAge
+            let shouldRefreshBCG = bcgEnabled && !isBCGRefreshing && Date().timeIntervalSince(lastBCGRefresh) > 5.0
             if shouldRefresh {
                 isRefreshing = true
             }
             if shouldRefreshLive {
                 isLiveRefreshing = true
             }
-            return (merged(cachedSensors, replacingWith: liveSensors), shouldRefresh, shouldRefreshLive)
+            if shouldRefreshBCG {
+                isBCGRefreshing = true
+            }
+            let withoutBCG = bcgEnabled ? bcgSensors : disabledBCGSensors()
+            return (merged(merged(cachedSensors, replacingWith: liveSensors), replacingWith: withoutBCG), shouldRefresh, shouldRefreshLive, shouldRefreshBCG)
         }
 
         if state.shouldRefresh {
@@ -47,7 +56,34 @@ final class EnvironmentCollector: @unchecked Sendable {
             }
         }
 
+        if state.shouldRefreshBCG {
+            Task.detached(priority: .utility) { [weak self] in
+                guard let self else { return }
+                let fresh = self.nativeSPU.sampleBCG()
+                self.stateQueue.async {
+                    self.bcgSensors = fresh
+                    self.lastBCGRefresh = Date()
+                    self.isBCGRefreshing = false
+                }
+            }
+        }
+
         return state.sensors
+    }
+
+    private func disabledBCGSensors() -> [SensorMetric] {
+        [SensorMetric(
+            id: "motion.bcg_heart_rate_status",
+            title: "BCG Heart Rate Status",
+            category: "Motion",
+            value: "disabled for low-power monitoring",
+            unit: "",
+            source: "NativeSPUHID",
+            quality: "ok",
+            rawKey: "native.spu_hid.bcg_status",
+            timestamp: Date(),
+            isExperimental: true
+        )]
     }
 
     private func collectFreshSample() -> [SensorMetric] {

@@ -110,21 +110,6 @@ struct PrivilegedHelperLauncher {
         return nil
     }
 
-    static func helperNeedsInstallOrRestart() -> Bool {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: outputPath) else { return true }
-        if let runningSchema = runningAgentSchemaVersion(),
-           let bundledSchema = bundledAgentSchemaVersion(),
-           runningSchema < bundledSchema {
-            return true
-        }
-        guard let attributes = try? fm.attributesOfItem(atPath: outputPath),
-              let modified = attributes[.modificationDate] as? Date else {
-            return true
-        }
-        return Date().timeIntervalSince(modified) > 30
-    }
-
     static func readLogTail(maxBytes: Int = 4000) -> String {
         guard let handle = FileHandle(forReadingAtPath: logPath) else { return "" }
         defer { try? handle.close() }

@@ -87,11 +87,6 @@ struct DashboardView: View {
         Binding {
             bcgHeartRateEnabled
         } set: { enabled in
-            if enabled {
-                enableBCGExperiment()
-            } else {
-                helper.refreshDiagnosis()
-            }
             bcgHeartRateEnabled = enabled
             store.setBCGHeartRateEnabled(enabled)
         }
@@ -608,8 +603,8 @@ struct DashboardView: View {
                     ("Gyroscope events", sensorDisplay("motion.gyroscope.events") ?? "—"),
                     ("Lid angle", sensorDisplay("motion.lid_angle_degrees") ?? "—"),
                     ("BCG heart-rate", sensorDisplay("motion.bcg_heart_rate_bpm") ?? bcgHeartRateStatus),
-                    ("BCG samples", rawValue("spu_hid.bcg_samples") ?? "—"),
-                    ("BCG confidence", rawValue("spu_hid.bcg_confidence") ?? "—"),
+                    ("BCG samples", sensorDisplay("motion.bcg_samples") ?? "—"),
+                    ("BCG confidence", sensorDisplay("motion.bcg_confidence") ?? "—"),
                     ("SPU HID devices", rawValue("spu_hid.device_count") ?? "—"),
                     ("Helper schema", rawValue("agent.schema_version") ?? "—"),
                     ("Attribution", rawValue("spu_hid.attribution") ?? "apple-silicon-accelerometer / MIT")
@@ -674,13 +669,13 @@ struct DashboardView: View {
     }
 
     private func helperControls(compact: Bool) -> some View {
-        SectionBox(title: "Backends", subtitle: "Native realtime runs in-app; Python remains optional for powermetrics/macmon fallback and experimental BCG.") {
+        SectionBox(title: "Backends", subtitle: "Native realtime runs in-app; Python remains optional for powermetrics/macmon fallback only.") {
             VStack(alignment: .leading, spacing: 12) {
                 Toggle(isOn: pythonBackendBinding) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Python Advanced Backend")
                             .font(.subheadline.weight(.semibold))
-                        Text("Optional LaunchDaemon JSON backend for counters still hidden from native IOReport/SMC on this macOS build and BCG experiments.")
+                        Text("Optional LaunchDaemon JSON backend for counters still hidden from native IOReport/SMC on this macOS build.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -741,7 +736,7 @@ struct DashboardView: View {
                         ("CPU source", "Mach host_processor_info"),
                         ("Memory source", "host_statistics64 + vm.swapusage"),
                         ("Native advanced", "IOReport energy/frequency + AppleSMC fan + PMGR DVFS"),
-                        ("Optional fallback", "macmon / powermetrics / system_profiler / Python BCG")
+                        ("Optional fallback", "macmon / powermetrics / system_profiler")
                     ])
                 }
             }
@@ -941,18 +936,6 @@ struct DashboardView: View {
         }
     }
 
-    private func enableBCGExperiment() {
-        if !pythonAdvancedBackendEnabled {
-            pythonAdvancedBackendEnabled = true
-            store.setPythonAdvancedBackendEnabled(true)
-        }
-        if PrivilegedHelperLauncher.helperNeedsInstallOrRestart() {
-            helper.start(intervalMS: min(activePreset.helperIntervalMS, 2_000))
-        } else {
-            helper.refreshDiagnosis()
-        }
-    }
-
     private func updateTelemetryUIContext() {
         store.setUIContext(sectionID: (section ?? .overview).rawValue, appIsActive: panelVisible)
     }
@@ -977,12 +960,6 @@ struct DashboardView: View {
     }
 
     private var bcgHeartRateStatus: String {
-        if bcgHeartRateEnabled && !pythonAdvancedBackendEnabled {
-            return "starting Python BCG helper"
-        }
-        if bcgHeartRateEnabled && helper.isBusy {
-            return "requesting helper access"
-        }
         let status = sensorDisplay("motion.bcg_heart_rate_status") ?? rawValue("spu_hid.bcg_status")
         guard bcgHeartRateEnabled else {
             return status ?? "disabled for low-power monitoring"

@@ -149,14 +149,13 @@ final class TelemetryStore: ObservableObject {
         let bcgEnabled = UserDefaults.standard.bool(forKey: "bcgHeartRateEnabled")
         let pythonEnabled = UserDefaults.standard.bool(forKey: pythonBackendKey)
         let helperEnabled = helperConsumerActive && pythonEnabled
-        let helperIntervalMS = helperEnabled
-            ? (bcgEnabled ? min(preset.helperIntervalMS, 2_000) : preset.helperIntervalMS)
-            : 60_000
+        let helperIntervalMS = helperEnabled ? preset.helperIntervalMS : 60_000
         let payload: [String: Any] = [
             "profile": helperEnabled ? preset.profileName : SamplingPreset.quiet.profileName,
             "helper_enabled": helperEnabled,
             "helper_interval_ms": helperIntervalMS,
-            "bcg_heart_rate_enabled": helperEnabled && bcgEnabled,
+            "bcg_heart_rate_enabled": false,
+            "native_bcg_heart_rate_enabled": bcgEnabled,
             "updated_at": ISO8601DateFormatter().string(from: Date())
         ]
         guard JSONSerialization.isValidJSONObject(payload),
