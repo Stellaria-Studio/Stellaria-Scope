@@ -3,6 +3,7 @@
 # SwiftPM and build output
 .build/
 Build/
+Dist/
 DerivedData/
 
 # Python cache

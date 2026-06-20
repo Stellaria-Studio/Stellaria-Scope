@@ -9,6 +9,9 @@ final class DisplayRefreshCollector {
     private var lastHostTime: UInt64 = 0
     private var intervals: [Double] = []
     private var timebase = mach_timebase_info_data_t()
+    private var isDisplayLinkRunning = false
+    private var lastBurstStarted = Date.distantPast
+    private var lastBurstCompleted = Date.distantPast
 
     init() {
         mach_timebase_info(&timebase)
@@ -22,7 +25,6 @@ final class DisplayRefreshCollector {
                 collector.record(hostTime: now.pointee.hostTime)
                 return kCVReturnSuccess
             }, opaqueSelf)
-            CVDisplayLinkStart(link)
         }
     }
 
@@ -32,7 +34,12 @@ final class DisplayRefreshCollector {
         }
     }
 
-    func sample() -> DisplayRefreshSnapshot {
+    func sample(active: Bool = true) -> DisplayRefreshSnapshot {
+        if active {
+            updateMeasurementState()
+        } else {
+            stopMeasurement()
+        }
         let measured = measuredHz()
         let displayID = CGMainDisplayID()
         let mode = CGDisplayCopyDisplayMode(displayID)
@@ -56,6 +63,45 @@ final class DisplayRefreshCollector {
             logicalHeight: mode.map { $0.height } ?? 0,
             timestamp: Date()
         )
+    }
+
+    private func updateMeasurementState() {
+        guard let displayLink else { return }
+        let now = Date()
+        lock.lock()
+        let shouldStart = !isDisplayLinkRunning
+            && (intervals.isEmpty || now.timeIntervalSince(lastBurstCompleted) > 15.0)
+        let shouldStop = isDisplayLinkRunning
+            && (intervals.count >= 45 || now.timeIntervalSince(lastBurstStarted) > 2.5)
+        lock.unlock()
+
+        if shouldStart {
+            lock.lock()
+            intervals.removeAll(keepingCapacity: true)
+            lastHostTime = 0
+            lastBurstStarted = now
+            isDisplayLinkRunning = true
+            lock.unlock()
+            CVDisplayLinkStart(displayLink)
+        } else if shouldStop {
+            CVDisplayLinkStop(displayLink)
+            lock.lock()
+            isDisplayLinkRunning = false
+            lastBurstCompleted = now
+            lock.unlock()
+        }
+    }
+
+    private func stopMeasurement() {
+        guard let displayLink else { return }
+        lock.lock()
+        let running = isDisplayLinkRunning
+        isDisplayLinkRunning = false
+        lastBurstCompleted = Date()
+        lock.unlock()
+        if running {
+            CVDisplayLinkStop(displayLink)
+        }
     }
 
     private func record(hostTime: UInt64) {

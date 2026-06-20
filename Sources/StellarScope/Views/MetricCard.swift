@@ -29,9 +29,45 @@ struct MetricCard<Content: View>: View {
 }
 
 extension View {
-    @ViewBuilder
     func stellarGlassSurface(radius: CGFloat = 18, interactive: Bool = false) -> some View {
+        modifier(StellarGlassSurfaceModifier(radius: radius, interactive: interactive))
+    }
+}
+
+private struct StellarRenderEffectsEnabledKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    var stellarRenderEffectsEnabled: Bool {
+        get { self[StellarRenderEffectsEnabledKey.self] }
+        set { self[StellarRenderEffectsEnabledKey.self] = newValue }
+    }
+}
+
+private struct StellarGlassSurfaceModifier: ViewModifier {
+    @Environment(\.stellarRenderEffectsEnabled) private var effectsEnabled
+    let radius: CGFloat
+    let interactive: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        if effectsEnabled {
+            liquidGlass(content: content, shape: shape)
+        } else {
+            content
+                .background {
+                    shape.fill(Color(nsColor: .controlBackgroundColor).opacity(0.72))
+                }
+                .clipShape(shape)
+                .overlay(shape.stroke(Color.white.opacity(0.10), lineWidth: 1))
+                .shadow(color: .black.opacity(0.10), radius: 8, x: 0, y: 3)
+        }
+    }
+
+    @ViewBuilder
+    private func liquidGlass(content: Content, shape: RoundedRectangle) -> some View {
         let wash = LinearGradient(
             colors: [
                 Color(red: 0.08, green: 0.18, blue: 0.30).opacity(0.78),
@@ -52,7 +88,7 @@ extension View {
         )
         if #available(macOS 26.0, *) {
             GlassEffectContainer {
-                self
+                content
                     .glassEffect(.regular.interactive(interactive), in: shape)
                     .background {
                         shape.fill(.ultraThinMaterial)
@@ -86,7 +122,7 @@ extension View {
                     .shadow(color: .black.opacity(0.24), radius: 16, x: 0, y: 8)
             }
         } else {
-            self
+            content
                 .background {
                     shape.fill(.thinMaterial)
                     shape.fill(wash)

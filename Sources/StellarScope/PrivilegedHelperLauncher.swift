@@ -8,7 +8,7 @@ struct PrivilegedHelperLauncher {
     static let launchdLabel = "com.lmz.StellarScope.PowermetricsAgent"
     static let launchdPlistPath = "/Library/LaunchDaemons/com.lmz.StellarScope.PowermetricsAgent.plist"
 
-    static func startPowermetricsAgent(intervalMS: Int = 1000) throws {
+    static func startPowermetricsAgent(intervalMS: Int = 5000) throws {
         let scriptPath = try embeddedAgentPath()
         let plist = launchdPlist(agentPath: scriptPath, intervalMS: intervalMS).replacingOccurrences(of: "\n", with: "")
 
@@ -52,6 +52,8 @@ struct PrivilegedHelperLauncher {
         let outputExists = fm.fileExists(atPath: outputPath)
         let pid = (try? String(contentsOfFile: pidPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
         let log = readLogTail(maxBytes: 1600)
+        let runningSchema = runningAgentSchemaVersion()
+        let bundledSchema = bundledAgentSchemaVersion()
 
         if outputExists {
             let mod = (try? fm.attributesOfItem(atPath: outputPath)[.modificationDate]) as? Date
@@ -61,16 +63,51 @@ struct PrivilegedHelperLauncher {
             } else {
                 ageText = "unknown age"
             }
-            if let pid, !pid.isEmpty {
-                return "Advanced helper is producing JSON (pid \(pid), updated \(ageText))."
+            if let runningSchema, let bundledSchema, runningSchema < bundledSchema {
+                return "Advanced helper is running old schema \(runningSchema); bundled schema \(bundledSchema) is available. Use Update Helper to reinstall and restart it."
             }
-            return "Advanced helper is producing JSON (updated \(ageText))."
+            let schemaText = runningSchema.map { ", schema \($0)" } ?? ""
+            if let pid, !pid.isEmpty {
+                return "Advanced helper is producing JSON (pid \(pid), updated \(ageText)\(schemaText))."
+            }
+            return "Advanced helper is producing JSON (updated \(ageText)\(schemaText))."
         }
 
         if !log.isEmpty {
             return "No JSON yet. Last helper log: \(log)"
         }
         return "No JSON yet and the helper log is empty. Try Start Advanced Helper again, or run scripts/start_advanced_helper.command once."
+    }
+
+    static func bundledAgentSchemaVersion() -> Int? {
+        guard let path = try? embeddedAgentPath(),
+              let text = try? String(contentsOfFile: path, encoding: .utf8),
+              let regex = try? NSRegularExpression(pattern: #"AGENT_SCHEMA_VERSION\s*=\s*(\d+)"#) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              match.numberOfRanges > 1,
+              let versionRange = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return Int(text[versionRange])
+    }
+
+    static func runningAgentSchemaVersion() -> Int? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: outputPath)),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let flat = object["flat"] as? [String: Any],
+              let value = flat["agent.schema_version"] else {
+            return nil
+        }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let string = value as? String {
+            return Int(string)
+        }
+        return nil
     }
 
     static func readLogTail(maxBytes: Int = 4000) -> String {
@@ -201,7 +238,7 @@ final class PrivilegedHelperController: ObservableObject {
     @Published var status: String = "Advanced helper not started."
     @Published var isBusy: Bool = false
 
-    func start(intervalMS: Int = 1000) {
+    func start(intervalMS: Int = 5000) {
         guard !isBusy else { return }
         isBusy = true
         status = "Requesting administrator permission…"
@@ -220,6 +257,33 @@ final class PrivilegedHelperController: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.status = "Failed to launch helper: \(error.localizedDescription)"
+                    self.isBusy = false
+                }
+            }
+        }
+    }
+
+    func update(intervalMS: Int = 5000) {
+        guard !isBusy else { return }
+        isBusy = true
+        let bundled = PrivilegedHelperLauncher.bundledAgentSchemaVersion()
+        status = bundled.map { "Requesting administrator permission to install helper schema \($0)…" }
+            ?? "Requesting administrator permission to update helper…"
+        Task.detached {
+            do {
+                try PrivilegedHelperLauncher.startPowermetricsAgent(intervalMS: intervalMS)
+                await MainActor.run {
+                    self.status = "Advanced helper updated. Waiting for restarted helper…"
+                    self.isBusy = false
+                }
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                let diagnosis = PrivilegedHelperLauncher.diagnose()
+                await MainActor.run {
+                    self.status = diagnosis
+                }
+            } catch {
+                await MainActor.run {
+                    self.status = "Failed to update helper: \(error.localizedDescription)"
                     self.isBusy = false
                 }
             }

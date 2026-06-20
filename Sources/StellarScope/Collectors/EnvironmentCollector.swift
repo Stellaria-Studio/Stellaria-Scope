@@ -2,17 +2,25 @@ import Foundation
 
 final class EnvironmentCollector: @unchecked Sendable {
     private let stateQueue = DispatchQueue(label: "com.lmz.StellarScope.EnvironmentCollector.state")
+    private let nativeSPU = NativeSPUHIDCollector()
     private var cachedSensors: [SensorMetric] = []
+    private var liveSensors: [SensorMetric] = []
     private var lastRefresh = Date.distantPast
+    private var lastLiveRefresh = Date.distantPast
     private var isRefreshing = false
+    private var isLiveRefreshing = false
 
-    func sample(maxAge: TimeInterval = 8.0) -> [SensorMetric] {
-        let state = stateQueue.sync { () -> (cached: [SensorMetric], shouldRefresh: Bool) in
+    func sample(maxAge: TimeInterval = 8.0, liveMaxAge: TimeInterval = 1.0) -> [SensorMetric] {
+        let state = stateQueue.sync { () -> (sensors: [SensorMetric], shouldRefresh: Bool, shouldRefreshLive: Bool) in
             let shouldRefresh = !isRefreshing && Date().timeIntervalSince(lastRefresh) > maxAge
+            let shouldRefreshLive = !isLiveRefreshing && Date().timeIntervalSince(lastLiveRefresh) > liveMaxAge
             if shouldRefresh {
                 isRefreshing = true
             }
-            return (cachedSensors, shouldRefresh)
+            if shouldRefreshLive {
+                isLiveRefreshing = true
+            }
+            return (merged(cachedSensors, replacingWith: liveSensors), shouldRefresh, shouldRefreshLive)
         }
 
         if state.shouldRefresh {
@@ -27,7 +35,19 @@ final class EnvironmentCollector: @unchecked Sendable {
             }
         }
 
-        return state.cached
+        if state.shouldRefreshLive {
+            Task.detached(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                let fresh = self.nativeSPU.sample()
+                self.stateQueue.async {
+                    self.liveSensors = fresh
+                    self.lastLiveRefresh = Date()
+                    self.isLiveRefreshing = false
+                }
+            }
+        }
+
+        return state.sensors
     }
 
     private func collectFreshSample() -> [SensorMetric] {
@@ -35,7 +55,7 @@ final class EnvironmentCollector: @unchecked Sendable {
         var sensors: [SensorMetric] = []
         let spuDevices = ioregPlist(className: "AppleSPUHIDDriver", timeout: 4)
         let alsDevices = ioregPlist(className: "AppleALSColorSensor", timeout: 4)
-        let rootDomain = ioregPlist(className: "IOPMrootDomain", timeout: 3)
+        let rootDomain = registryProperties(for: "IOPMrootDomain").map { [$0] } ?? ioregPlist(className: "IOPMrootDomain", timeout: 3)
 
         append(&sensors, id: "motion.spu_device_count", title: "SPU HID Device Count", category: "Motion", value: spuDevices.count, unit: "", source: "IORegistry", rawKey: "AppleSPUHIDDriver", timestamp: timestamp)
 
@@ -86,6 +106,24 @@ final class EnvironmentCollector: @unchecked Sendable {
         }
 
         return sensors
+    }
+
+    private func merged(_ base: [SensorMetric], replacingWith live: [SensorMetric]) -> [SensorMetric] {
+        guard !live.isEmpty else { return base }
+        var result = base
+        var positions: [String: Int] = [:]
+        for (index, sensor) in result.enumerated() {
+            positions[sensor.id] = index
+        }
+        for sensor in live {
+            if let index = positions[sensor.id] {
+                result[index] = sensor
+            } else {
+                positions[sensor.id] = result.count
+                result.append(sensor)
+            }
+        }
+        return result
     }
 
     private func append(
@@ -142,6 +180,18 @@ final class EnvironmentCollector: @unchecked Sendable {
         } catch {
             return []
         }
+    }
+
+    private func registryProperties(for className: String) -> [String: Any]? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(className))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        var properties: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let retained = properties?.takeRetainedValue() else {
+            return nil
+        }
+        return retained as NSDictionary as? [String: Any]
     }
 
     private func firstSPUDevice(in devices: [[String: Any]], named name: String) -> [String: Any]? {

@@ -46,7 +46,7 @@ cat > "$TMPPLIST" <<EOF
     <key>EnvironmentVariables</key>
     <dict>
         <key>STELLARSCOPE_INTERVAL_MS</key>
-        <string>1000</string>
+        <string>5000</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
     </dict>

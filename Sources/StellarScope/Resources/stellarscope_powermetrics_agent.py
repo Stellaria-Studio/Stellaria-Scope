@@ -16,21 +16,46 @@ import os
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
+import ctypes
+import ctypes.util
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 OUT = Path("/tmp/stellarscope-powermetrics.json")
 CONTROL_PATH = Path("/tmp/stellarscope-control.json")
-INTERVAL_MS = int(os.environ.get("STELLARSCOPE_INTERVAL_MS", "1000"))
-SAMPLE_MS = max(250, INTERVAL_MS)
+try:
+    INTERVAL_MS = int(os.environ.get("STELLARSCOPE_INTERVAL_MS", "5000"))
+except Exception:
+    INTERVAL_MS = 5000
+INTERVAL_MS = max(1000, min(INTERVAL_MS, 60_000))
+SAMPLE_MS = 1000
 PROFILE = os.environ.get("STELLARSCOPE_PROFILE", "live").lower()
-AGENT_SCHEMA_VERSION = 5
-AGENT_FEATURES = "dynamic_sensors,smc_fan,display,storage,audio,bus,runtime_control,promotion_vrr,environment_motion"
+BCG_HEART_RATE_ENABLED = os.environ.get("STELLARSCOPE_BCG_HEART_RATE", "0").lower() in {"1", "true", "yes", "on"}
+HELPER_ENABLED = os.environ.get("STELLARSCOPE_HELPER_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+AGENT_SCHEMA_VERSION = 9
+AGENT_FEATURES = "dynamic_sensors,smc_fan,display,storage,audio,bus,runtime_control,runtime_disable,promotion_vrr,environment_motion,low_power_cadence,spu_hid_lid_als,live_spu_tick"
 SLOW_CACHE: dict[str, dict[str, Any]] = {}
+
+# SPU HID constants adapted from olvvier/apple-silicon-accelerometer (MIT).
+SPU_PAGE_VENDOR = 0xFF00
+SPU_PAGE_SENSOR = 0x0020
+SPU_USAGE_ACCEL = 3
+SPU_USAGE_GYRO = 9
+SPU_USAGE_ALS = 4
+SPU_USAGE_LID = 138
+SPU_ALS_REPORT_LEN = 122
+SPU_LID_REPORT_LEN = 3
+SPU_IMU_REPORT_LEN = 22
+SPU_IMU_DATA_OFF = 6
+SPU_ACCEL_SCALE = 65536.0
+SPU_ALS_LUX_OFF = 40
+SPU_ALS_CH_OFFSETS = [20, 24, 28, 32]
+SPU_REPORT_BUF_SZ = 4096
 
 # Apple Silicon community tools often install here. We do not require them.
 MACMON_CANDIDATES = [
@@ -97,8 +122,22 @@ def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+def bool_control(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 def apply_runtime_control() -> None:
-    global INTERVAL_MS, SAMPLE_MS, PROFILE
+    global INTERVAL_MS, SAMPLE_MS, PROFILE, BCG_HEART_RATE_ENABLED, HELPER_ENABLED
     if not CONTROL_PATH.exists():
         return
     try:
@@ -107,28 +146,46 @@ def apply_runtime_control() -> None:
         return
     if not isinstance(data, dict):
         return
-    INTERVAL_MS = clamp_int(data.get("helper_interval_ms"), INTERVAL_MS, 250, 10_000)
-    SAMPLE_MS = max(250, INTERVAL_MS)
+    if "helper_enabled" in data or "enabled" in data:
+        HELPER_ENABLED = bool_control(data.get("helper_enabled", data.get("enabled")), HELPER_ENABLED)
+    INTERVAL_MS = clamp_int(data.get("helper_interval_ms"), INTERVAL_MS, 1000, 60_000)
+    SAMPLE_MS = 1000
     profile = str(data.get("profile", PROFILE)).lower()
     if profile in {"quiet", "live", "bench"}:
         PROFILE = profile
+    if not HELPER_ENABLED:
+        INTERVAL_MS = 60_000
+        PROFILE = "quiet"
+        if BCG_HEART_RATE_ENABLED:
+            BCG_HEART_RATE_ENABLED = False
+            SLOW_CACHE.pop("environment", None)
+        return
+    if "bcg_heart_rate_enabled" in data:
+        enabled = bool_control(data.get("bcg_heart_rate_enabled"), BCG_HEART_RATE_ENABLED)
+        if enabled != BCG_HEART_RATE_ENABLED:
+            BCG_HEART_RATE_ENABLED = enabled
+            SLOW_CACHE.pop("environment", None)
 
 
 def cadence(name: str) -> int:
     tables = {
-        "quiet": {"smc": 10, "debug": 30, "system": 90},
-        "live": {"smc": 5, "debug": 15, "system": 30},
-        "bench": {"smc": 3, "debug": 8, "system": 12},
+        "quiet": {"thermal": 2, "battery": 2, "fan": 4, "smc": 8, "debug": 12, "inventory": 0, "environment": 6},
+        "live": {"thermal": 1, "battery": 2, "fan": 3, "smc": 6, "debug": 8, "inventory": 0, "environment": 6},
+        "bench": {"thermal": 1, "battery": 3, "fan": 4, "smc": 6, "debug": 10, "inventory": 0, "environment": 10},
     }
     return tables.get(PROFILE, tables["live"]).get(name, 30)
 
 
 def cached_collect(name: str, loop_index: int, every: int, collector: Any) -> dict[str, Any]:
     cached = SLOW_CACHE.get(name)
-    if cached is None or loop_index % max(1, every) == 0:
+    should_refresh = cached is None
+    if cached is not None and every > 0:
+        should_refresh = loop_index % every == 0
+    if should_refresh:
         cached = collector()
         cached.setdefault("flat", {})[f"{name}.cache_refreshed_loop"] = loop_index
         cached.setdefault("flat", {})[f"{name}.cache_profile"] = PROFILE
+        cached.setdefault("flat", {})[f"{name}.cache_cadence_loops"] = every
         SLOW_CACHE[name] = cached
     return cached
 
@@ -247,6 +304,19 @@ def merge_sensors(dst: list[dict[str, Any]], src: list[dict[str, Any]]) -> None:
         if sid and sid not in seen:
             dst.append(item)
             seen.add(sid)
+
+
+def upsert_sensors(dst: list[dict[str, Any]], src: list[dict[str, Any]]) -> None:
+    positions = {str(item.get("id")): idx for idx, item in enumerate(dst) if item.get("id")}
+    for item in src:
+        sid = str(item.get("id"))
+        if not sid:
+            continue
+        if sid in positions:
+            dst[positions[sid]] = item
+        else:
+            positions[sid] = len(dst)
+            dst.append(item)
 
 
 def safe_id(text: Any) -> str:
@@ -1069,6 +1139,325 @@ def first_spu_device(devices: list[Any], name: str) -> dict[str, Any] | None:
     return None
 
 
+def parse_spu_lid_report(data: bytes) -> float | None:
+    if len(data) < SPU_LID_REPORT_LEN or data[0] != 1:
+        return None
+    return float(struct.unpack("<H", data[1:3])[0] & 0x1FF)
+
+
+def parse_spu_als_report(data: bytes) -> dict[str, Any] | None:
+    if len(data) < 44:
+        return None
+    lux = struct.unpack_from("<f", data, SPU_ALS_LUX_OFF)[0]
+    channels = [struct.unpack_from("<I", data, offset)[0] for offset in SPU_ALS_CH_OFFSETS]
+    total = sum(channels)
+    dominant = max(range(len(channels)), key=lambda idx: channels[idx]) if total > 0 else None
+    chroma = [(channel / total) if total > 0 else 0.0 for channel in channels]
+    return {"lux": lux, "channels": channels, "dominant": dominant, "chroma": chroma}
+
+
+def parse_spu_accel_report(data: bytes) -> tuple[float, float, float] | None:
+    if len(data) < SPU_IMU_REPORT_LEN:
+        return None
+    offset = SPU_IMU_DATA_OFF
+    x = struct.unpack("<i", data[offset:offset + 4])[0] / SPU_ACCEL_SCALE
+    y = struct.unpack("<i", data[offset + 4:offset + 8])[0] / SPU_ACCEL_SCALE
+    z = struct.unpack("<i", data[offset + 8:offset + 12])[0] / SPU_ACCEL_SCALE
+    return x, y, z
+
+
+def estimate_bcg_heart_rate(samples: list[tuple[float, float, float, float]]) -> dict[str, Any]:
+    if len(samples) < 120:
+        return {"status": "not enough samples", "bpm": None, "confidence": 0.0}
+    duration = samples[-1][0] - samples[0][0]
+    if duration <= 1.0:
+        return {"status": "sample window too short", "bpm": None, "confidence": 0.0}
+    sample_rate = len(samples) / duration
+    if sample_rate < 20:
+        return {"status": "sample rate too low", "bpm": None, "confidence": 0.0, "sample_rate_hz": sample_rate}
+
+    mags = []
+    hp_alpha = sample_rate / (sample_rate + 2.0 * 3.141592653589793 * 0.8)
+    lp_alpha = 2.0 * 3.141592653589793 * 3.0 / (2.0 * 3.141592653589793 * 3.0 + sample_rate)
+    hp_prev_in = None
+    hp_prev_out = 0.0
+    lp_prev = 0.0
+    for _, ax, ay, az in samples:
+        mag = (ax * ax + ay * ay + az * az) ** 0.5
+        if hp_prev_in is None:
+            hp_prev_in = mag
+            continue
+        hp_out = hp_alpha * (hp_prev_out + mag - hp_prev_in)
+        hp_prev_in = mag
+        hp_prev_out = hp_out
+        lp_prev = lp_alpha * hp_out + (1.0 - lp_alpha) * lp_prev
+        mags.append(lp_prev)
+
+    if len(mags) < int(sample_rate * 4):
+        return {"status": "not enough filtered data", "bpm": None, "confidence": 0.0, "sample_rate_hz": sample_rate}
+
+    window = mags[-int(sample_rate * 10):]
+    mean = sum(window) / len(window)
+    centered = [value - mean for value in window]
+    variance = sum(value * value for value in centered)
+    if variance < 1e-20:
+        return {"status": "no usable BCG signal", "bpm": None, "confidence": 0.0, "sample_rate_hz": sample_rate}
+
+    lag_low = max(1, int(sample_rate * 0.3))
+    lag_high = min(int(sample_rate * 1.0), len(centered) // 2)
+    if lag_low >= lag_high:
+        return {"status": "window too short for heart-rate lag", "bpm": None, "confidence": 0.0, "sample_rate_hz": sample_rate}
+
+    best_corr = -1.0
+    best_lag = lag_low
+    for lag in range(lag_low, lag_high):
+        corr = sum(centered[idx] * centered[idx + lag] for idx in range(len(centered) - lag)) / variance
+        if corr > best_corr:
+            best_corr = corr
+            best_lag = lag
+
+    bpm = 60.0 / (best_lag / sample_rate)
+    confidence = max(0.0, min(1.0, best_corr))
+    if confidence < 0.15:
+        return {"status": "low confidence", "bpm": bpm, "confidence": confidence, "sample_rate_hz": sample_rate}
+    return {"status": "ok", "bpm": bpm, "confidence": confidence, "sample_rate_hz": sample_rate}
+
+
+def collect_spu_hid_snapshot_once(timeout_s: float = 1.2, include_bcg: bool | None = None) -> dict[str, Any]:
+    sample_bcg = BCG_HEART_RATE_ENABLED if include_bcg is None else include_bcg
+    timeout_s = max(timeout_s, 5.0) if sample_bcg else timeout_s
+    flat: dict[str, Any] = {
+        "spu_hid.source": "AppleSPUHIDDevice",
+        "spu_hid.timeout_s": timeout_s,
+        "spu_hid.attribution": "Inspired by olvvier/apple-silicon-accelerometer (MIT)",
+        "spu_hid.bcg_heart_rate_enabled": BCG_HEART_RATE_ENABLED,
+        "spu_hid.bcg_sampling_active": sample_bcg,
+    }
+    sensors: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}
+
+    try:
+        iokit_path = ctypes.util.find_library("IOKit")
+        cf_path = ctypes.util.find_library("CoreFoundation")
+        if not iokit_path or not cf_path:
+            raise RuntimeError("IOKit/CoreFoundation not found")
+        iokit = ctypes.cdll.LoadLibrary(iokit_path)
+        cf = ctypes.cdll.LoadLibrary(cf_path)
+
+        kCFAllocatorDefault = ctypes.c_void_p.in_dll(cf, "kCFAllocatorDefault")
+        kCFRunLoopDefaultMode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
+
+        iokit.IOServiceMatching.restype = ctypes.c_void_p
+        iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        iokit.IOServiceGetMatchingServices.restype = ctypes.c_int
+        iokit.IOServiceGetMatchingServices.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        iokit.IOIteratorNext.restype = ctypes.c_uint
+        iokit.IOIteratorNext.argtypes = [ctypes.c_uint]
+        iokit.IOObjectRelease.argtypes = [ctypes.c_uint]
+        iokit.IORegistryEntryCreateCFProperty.restype = ctypes.c_void_p
+        iokit.IORegistryEntryCreateCFProperty.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        iokit.IORegistryEntrySetCFProperty.restype = ctypes.c_int
+        iokit.IORegistryEntrySetCFProperty.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+        iokit.IOHIDDeviceCreate.restype = ctypes.c_void_p
+        iokit.IOHIDDeviceCreate.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        iokit.IOHIDDeviceOpen.restype = ctypes.c_int
+        iokit.IOHIDDeviceOpen.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback.restype = None
+        iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p
+        ]
+        iokit.IOHIDDeviceScheduleWithRunLoop.restype = None
+        iokit.IOHIDDeviceScheduleWithRunLoop.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        if hasattr(iokit, "IOHIDDeviceUnscheduleFromRunLoop"):
+            iokit.IOHIDDeviceUnscheduleFromRunLoop.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        if hasattr(iokit, "IOHIDDeviceClose"):
+            iokit.IOHIDDeviceClose.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFNumberCreate.restype = ctypes.c_void_p
+        cf.CFNumberCreate.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+        cf.CFRunLoopRunInMode.restype = ctypes.c_int32
+        cf.CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
+        if hasattr(cf, "CFRelease"):
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        def cfstr(value: str) -> ctypes.c_void_p:
+            return cf.CFStringCreateWithCString(None, value.encode(), 0x08000100)
+
+        def cfnum32(value: int) -> ctypes.c_void_p:
+            val = ctypes.c_int32(value)
+            return cf.CFNumberCreate(None, 3, ctypes.byref(val))
+
+        def prop_int(service: int, key: str) -> int | None:
+            ref = iokit.IORegistryEntryCreateCFProperty(service, cfstr(key), None, 0)
+            if not ref:
+                return None
+            try:
+                value = ctypes.c_long()
+                if cf.CFNumberGetValue(ref, 4, ctypes.byref(value)):
+                    return int(value.value)
+            finally:
+                if hasattr(cf, "CFRelease"):
+                    cf.CFRelease(ref)
+            return None
+
+        # Wake the low-rate SPU sensor paths long enough to capture a snapshot.
+        driver_it = ctypes.c_uint()
+        iokit.IOServiceGetMatchingServices(0, iokit.IOServiceMatching(b"AppleSPUHIDDriver"), ctypes.byref(driver_it))
+        while True:
+            svc = iokit.IOIteratorNext(driver_it.value)
+            if not svc:
+                break
+            for key, value in (
+                ("SensorPropertyReportingState", 1),
+                ("SensorPropertyPowerState", 1),
+                ("ReportInterval", 50_000),
+            ):
+                iokit.IORegistryEntrySetCFProperty(svc, cfstr(key), cfnum32(value))
+            iokit.IOObjectRelease(svc)
+        iokit.IOObjectRelease(driver_it.value)
+
+        latest: dict[str, Any] = {}
+        accel_samples: list[tuple[float, float, float, float]] = []
+        callback_roots: list[Any] = []
+        hid_devices: list[Any] = []
+        run_loop = cf.CFRunLoopGetCurrent()
+
+        ts_callback = ctypes.CFUNCTYPE(
+            None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_long, ctypes.c_uint64,
+        )
+
+        def on_als_report(_ctx, _result, _sender, _rtype, _rid, report, length, _timestamp):
+            try:
+                if length >= SPU_ALS_REPORT_LEN:
+                    parsed = parse_spu_als_report(bytes(report[:SPU_ALS_REPORT_LEN]))
+                    if parsed:
+                        latest["als"] = parsed
+            except Exception:
+                pass
+
+        def on_lid_report(_ctx, _result, _sender, _rtype, _rid, report, length, _timestamp):
+            try:
+                angle = parse_spu_lid_report(bytes(report[:length]))
+                if angle is not None:
+                    latest["lid_angle_deg"] = angle
+            except Exception:
+                pass
+
+        def on_accel_report(_ctx, _result, _sender, _rtype, _rid, report, length, _timestamp):
+            try:
+                if length >= SPU_IMU_REPORT_LEN and len(accel_samples) < 8_000:
+                    parsed = parse_spu_accel_report(bytes(report[:SPU_IMU_REPORT_LEN]))
+                    if parsed:
+                        accel_samples.append((time.monotonic(), parsed[0], parsed[1], parsed[2]))
+            except Exception:
+                pass
+
+        als_cb = ts_callback(on_als_report)
+        lid_cb = ts_callback(on_lid_report)
+        accel_cb = ts_callback(on_accel_report)
+        callback_roots.extend([als_cb, lid_cb, accel_cb])
+
+        device_it = ctypes.c_uint()
+        iokit.IOServiceGetMatchingServices(0, iokit.IOServiceMatching(b"AppleSPUHIDDevice"), ctypes.byref(device_it))
+        seen_devices = 0
+        while True:
+            svc = iokit.IOIteratorNext(device_it.value)
+            if not svc:
+                break
+            seen_devices += 1
+            usage_page = prop_int(svc, "PrimaryUsagePage") or 0
+            usage = prop_int(svc, "PrimaryUsage") or 0
+            flat[f"spu_hid.device{seen_devices}.usage_page"] = usage_page
+            flat[f"spu_hid.device{seen_devices}.usage"] = usage
+
+            callback = None
+            if (usage_page, usage) == (SPU_PAGE_VENDOR, SPU_USAGE_ALS):
+                callback = als_cb
+            elif (usage_page, usage) == (SPU_PAGE_SENSOR, SPU_USAGE_LID):
+                callback = lid_cb
+            elif sample_bcg and (usage_page, usage) == (SPU_PAGE_VENDOR, SPU_USAGE_ACCEL):
+                callback = accel_cb
+
+            if callback is not None:
+                hid = iokit.IOHIDDeviceCreate(kCFAllocatorDefault, svc)
+                if hid and iokit.IOHIDDeviceOpen(hid, 0) == 0:
+                    report_buffer = (ctypes.c_uint8 * SPU_REPORT_BUF_SZ)()
+                    callback_roots.append(report_buffer)
+                    hid_devices.append(hid)
+                    iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback(
+                        hid, report_buffer, SPU_REPORT_BUF_SZ, callback, None
+                    )
+                    iokit.IOHIDDeviceScheduleWithRunLoop(hid, run_loop, kCFRunLoopDefaultMode)
+            iokit.IOObjectRelease(svc)
+        iokit.IOObjectRelease(device_it.value)
+        flat["spu_hid.device_count"] = seen_devices
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and ("als" not in latest or "lid_angle_deg" not in latest or (sample_bcg and len(accel_samples) < 180)):
+            cf.CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, False)
+
+        for hid in hid_devices:
+            try:
+                if hasattr(iokit, "IOHIDDeviceUnscheduleFromRunLoop"):
+                    iokit.IOHIDDeviceUnscheduleFromRunLoop(hid, run_loop, kCFRunLoopDefaultMode)
+                if hasattr(iokit, "IOHIDDeviceClose"):
+                    iokit.IOHIDDeviceClose(hid, 0)
+                if hasattr(cf, "CFRelease"):
+                    cf.CFRelease(hid)
+            except Exception:
+                pass
+
+        if "lid_angle_deg" in latest:
+            angle = latest["lid_angle_deg"]
+            flat["spu_hid.lid_angle_degrees"] = angle
+            append_sensor(sensors, "motion.lid_angle_degrees", "Lid Angle", "Motion", angle, "deg", "AppleSPUHIDDevice", raw_key="spu_hid.lid_angle_degrees", is_experimental=True)
+
+        als = latest.get("als")
+        if isinstance(als, dict):
+            lux = als.get("lux")
+            channels = als.get("channels") or []
+            chroma = als.get("chroma") or []
+            flat["spu_hid.als_lux"] = lux
+            flat["spu_hid.als_channels"] = ",".join(str(x) for x in channels)
+            flat["spu_hid.als_dominant_channel"] = als.get("dominant")
+            append_sensor(sensors, "environment.spu_ambient_lux", "SPU Ambient Light", "Environment", lux, "lx", "AppleSPUHIDDevice", raw_key="spu_hid.als_lux", is_experimental=True)
+            for idx, value in enumerate(channels[:4]):
+                append_sensor(sensors, f"environment.als_color_channel_{idx}", f"ALS Color Channel {idx}", "Color", value, "", "AppleSPUHIDDevice", raw_key=f"spu_hid.als_channels[{idx}]", is_experimental=True)
+            for idx, value in enumerate(chroma[:4]):
+                append_sensor(sensors, f"environment.als_chroma_{idx}", f"ALS Chroma {idx}", "Color", value * 100.0, "%", "AppleSPUHIDDevice", raw_key=f"spu_hid.als_chroma[{idx}]", is_experimental=True)
+
+        if seen_devices:
+            if sample_bcg:
+                estimate = estimate_bcg_heart_rate(accel_samples)
+                flat["spu_hid.bcg_samples"] = len(accel_samples)
+                flat["spu_hid.bcg_status"] = estimate.get("status")
+                flat["spu_hid.bcg_confidence"] = estimate.get("confidence")
+                flat["spu_hid.bcg_sample_rate_hz"] = estimate.get("sample_rate_hz")
+                if estimate.get("bpm") is not None:
+                    flat["spu_hid.bcg_bpm"] = estimate.get("bpm")
+                    quality = "ok" if estimate.get("status") == "ok" else "low_confidence"
+                    append_sensor(sensors, "motion.bcg_heart_rate_bpm", "BCG Heart Rate", "Motion", estimate.get("bpm"), "bpm", "AppleSPUHIDDevice", quality=quality, raw_key="spu_hid.bcg_bpm", is_experimental=True)
+                    status = f"{estimate.get('status')}, confidence {float(estimate.get('confidence') or 0):.2f}"
+                else:
+                    status = f"enabled; {estimate.get('status', 'no result')}"
+            elif BCG_HEART_RATE_ENABLED:
+                status = None
+            else:
+                status = "disabled for low-power monitoring"
+            if status is not None:
+                append_sensor(sensors, "motion.bcg_heart_rate_status", "BCG Heart Rate Status", "Motion", status, "", "apple-silicon-accelerometer study", raw_key="motion_live.detect_heartbeat", is_experimental=True)
+        return {"summary": summary, "flat": flat, "sensors": sensors}
+    except Exception as exc:  # noqa: BLE001
+        return {"summary": {}, "flat": {**flat, "spu_hid.error": f"{type(exc).__name__}: {exc}"}, "sensors": sensors}
+
+
 def collect_environment_motion_once() -> dict[str, Any]:
     flat: dict[str, Any] = {"environment.command": "ioreg SPU/ALS/IOPMrootDomain"}
     sensors: list[dict[str, Any]] = []
@@ -1133,6 +1522,10 @@ def collect_environment_motion_once() -> dict[str, Any]:
         append_sensor(sensors, "environment.clamshell_closed", "Clamshell Closed", "Environment", root.get("AppleClamshellState"), "", "IOPMrootDomain", raw_key="AppleClamshellState")
         append_sensor(sensors, "environment.clamshell_causes_sleep", "Clamshell Causes Sleep", "Environment", root.get("AppleClamshellCausesSleep"), "", "IOPMrootDomain", raw_key="AppleClamshellCausesSleep")
         append_sensor(sensors, "environment.wake_reason", "Wake Reason", "Environment", root.get("Wake Reason"), "", "IOPMrootDomain", raw_key="Wake Reason")
+
+        hid = collect_spu_hid_snapshot_once()
+        flat.update(hid.get("flat", {}))
+        merge_sensors(sensors, hid.get("sensors", []))
         return {"summary": {}, "flat": flat, "sensors": sensors}
     except Exception as exc:  # noqa: BLE001
         return {"summary": {}, "flat": {"environment.error": f"{type(exc).__name__}: {exc}", **flat}, "sensors": sensors}
@@ -1195,21 +1588,21 @@ def merge_auxiliary(payload: dict[str, Any], loop_index: int) -> dict[str, Any]:
     payload["flat"]["agent.sample_ms"] = SAMPLE_MS
     payload["flat"]["agent.loop_index"] = loop_index
     payload["flat"]["agent.profile"] = PROFILE
+    payload["flat"]["agent.helper_enabled"] = HELPER_ENABLED
     payload["flat"]["agent.control_path"] = str(CONTROL_PATH)
     payload["flat"]["agent.schema_version"] = AGENT_SCHEMA_VERSION
     payload["flat"]["agent.features"] = AGENT_FEATURES
 
-    # Thermal pressure is cheap and useful; refresh each loop.
-    thermal = collect_thermal_pressure_once()
+    thermal = cached_collect("thermal", loop_index, cadence("thermal"), collect_thermal_pressure_once)
     merge_summary(payload["summary"], thermal.get("summary", {}), prefer_new=True)
     payload["flat"].update(thermal.get("flat", {}))
     merge_sensors(payload["sensors"], thermal.get("sensors", []))
 
-    battery = collect_battery_once()
+    battery = cached_collect("battery", loop_index, cadence("battery"), collect_battery_once)
     payload["flat"].update(battery.get("flat", {}))
     merge_sensors(payload["sensors"], battery.get("sensors", []))
 
-    smc_fan = collect_smc_fan_readonly_once()
+    smc_fan = cached_collect("smc_fan", loop_index, cadence("fan"), collect_smc_fan_readonly_once)
     merge_summary(payload["summary"], smc_fan.get("summary", {}), prefer_new=True)
     payload["flat"].update(smc_fan.get("flat", {}))
     merge_sensors(payload["sensors"], smc_fan.get("sensors", []))
@@ -1229,14 +1622,78 @@ def merge_auxiliary(payload: dict[str, Any], loop_index: int) -> dict[str, Any]:
         ("storage", collect_storage_once),
         ("audio", collect_audio_once),
         ("bus", collect_bus_once),
+    ):
+        block = cached_collect(name, loop_index, cadence("inventory"), collector)
+        payload["flat"].update(block.get("flat", {}))
+        merge_sensors(payload["sensors"], block.get("sensors", []))
+
+    for name, collector in (
         ("environment", collect_environment_motion_once),
     ):
-        block = cached_collect(name, loop_index, cadence("system"), collector)
+        cached_environment = SLOW_CACHE.get(name)
+        if BCG_HEART_RATE_ENABLED and cached_environment is not None:
+            cached_enabled = cached_environment.get("flat", {}).get("spu_hid.bcg_heart_rate_enabled")
+            cached_status = str(cached_environment.get("flat", {}).get("spu_hid.bcg_status", ""))
+            if cached_enabled is not True or cached_status.startswith("disabled"):
+                SLOW_CACHE.pop(name, None)
+        block = cached_collect(name, loop_index, 1 if BCG_HEART_RATE_ENABLED else cadence("environment"), collector)
         payload["flat"].update(block.get("flat", {}))
         merge_sensors(payload["sensors"], block.get("sensors", []))
 
     merge_sensors(payload["sensors"], sensors_from_summary(payload["summary"], str(payload.get("source", "summary")), prefix="summary"))
     return payload
+
+
+def live_sensor_interval_s() -> float:
+    if not HELPER_ENABLED:
+        return 60.0
+    table = {"quiet": 2.0, "live": 1.0, "bench": 0.5}
+    return table.get(PROFILE, 1.0)
+
+
+def merge_live_sensor_tick(payload: dict[str, Any], loop_index: int) -> dict[str, Any] | None:
+    if not HELPER_ENABLED or not BCG_HEART_RATE_ENABLED:
+        return None
+    block = collect_spu_hid_snapshot_once(timeout_s=0.25, include_bcg=False)
+    sensors = block.get("sensors", [])
+    flat = block.get("flat", {})
+    if not sensors and not flat:
+        return None
+
+    next_payload = dict(payload)
+    next_payload["summary"] = dict(payload.get("summary", {}))
+    next_payload["flat"] = dict(payload.get("flat", {}))
+    next_payload["sensors"] = list(payload.get("sensors", []))
+    next_payload["timestamp"] = now_iso()
+    next_payload["status"] = payload.get("status", "running")
+    next_payload["flat"].update(flat)
+    next_payload["flat"]["agent.live_tick_loop"] = loop_index
+    next_payload["flat"]["agent.live_tick_profile"] = PROFILE
+    next_payload["flat"]["agent.live_tick_interval_s"] = live_sensor_interval_s()
+    upsert_sensors(next_payload["sensors"], sensors)
+    return next_payload
+
+
+def standby_payload(loop_index: int) -> dict[str, Any]:
+    return {
+        "timestamp": now_iso(),
+        "status": "disabled",
+        "source": "standby",
+        "pid": os.getpid(),
+        "summary": {},
+        "sensors": [],
+        "flat": {
+            "agent.message": "helper disabled by StellarScope low-power control",
+            "agent.helper_enabled": False,
+            "agent.interval_ms": INTERVAL_MS,
+            "agent.sample_ms": SAMPLE_MS,
+            "agent.loop_index": loop_index,
+            "agent.profile": PROFILE,
+            "agent.control_path": str(CONTROL_PATH),
+            "agent.schema_version": AGENT_SCHEMA_VERSION,
+            "agent.features": AGENT_FEATURES,
+        },
+    }
 
 
 def main() -> int:
@@ -1250,6 +1707,7 @@ def main() -> int:
         "flat": {
             "agent.message": "helper process started",
             "agent.interval_ms": INTERVAL_MS,
+            "agent.helper_enabled": HELPER_ENABLED,
             "agent.schema_version": AGENT_SCHEMA_VERSION,
             "agent.features": AGENT_FEATURES,
         },
@@ -1274,14 +1732,28 @@ def main() -> int:
     print(f"StellarScope v8 agent pid={os.getpid()} interval={INTERVAL_MS}ms writing {OUT}", flush=True)
 
     loop_index = 0
+    last_payload: dict[str, Any] | None = None
     while True:
         start = time.monotonic()
         apply_runtime_control()
+        if not HELPER_ENABLED:
+            payload = standby_payload(loop_index)
+            atomic_write_json(OUT, payload)
+            last_payload = payload
+            loop_index += 1
+            deadline = start + 60.0
+            while time.monotonic() < deadline:
+                time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
+                apply_runtime_control()
+                if HELPER_ENABLED:
+                    break
+            continue
         payload = collect_power_once()
         payload = merge_auxiliary(payload, loop_index)
         payload["timestamp"] = now_iso()
         payload["status"] = "running" if payload.get("summary") else payload.get("status", "running")
         atomic_write_json(OUT, payload)
+        last_payload = payload
 
         s = payload.get("summary", {})
         print(
@@ -1295,8 +1767,23 @@ def main() -> int:
         elapsed = time.monotonic() - start
         target = INTERVAL_MS / 1000.0
         # If the OS commands finish faster than requested, maintain the cadence.
-        if elapsed < target:
-            time.sleep(target - elapsed)
+        deadline = start + target
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            tick_interval = live_sensor_interval_s()
+            if remaining <= tick_interval:
+                time.sleep(max(0, remaining))
+                break
+            time.sleep(tick_interval)
+            if time.monotonic() >= deadline:
+                break
+            apply_runtime_control()
+            if last_payload is None:
+                continue
+            live_payload = merge_live_sensor_tick(last_payload, loop_index)
+            if live_payload is not None:
+                last_payload = live_payload
+                atomic_write_json(OUT, live_payload)
 
 
 if __name__ == "__main__":

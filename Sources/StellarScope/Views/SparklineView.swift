@@ -23,6 +23,7 @@ struct SparklineView: View {
 }
 
 struct MeterBar: View {
+    @Environment(\.stellarRenderEffectsEnabled) private var effectsEnabled
     var value: Double
     var height: CGFloat = 8
     @State private var displayedValue: Double = 0
@@ -55,7 +56,7 @@ struct MeterBar: View {
                         )
                     )
                     .frame(width: max(displayedValue > 0 ? height : 0, width))
-                    .shadow(color: Color(red: 0.14, green: 0.48, blue: 1.0).opacity(0.35), radius: 6, x: 0, y: 0)
+                    .shadow(color: effectsEnabled ? Color(red: 0.14, green: 0.48, blue: 1.0).opacity(0.35) : .clear, radius: effectsEnabled ? 6 : 0, x: 0, y: 0)
             }
         }
         .frame(height: height)
@@ -63,7 +64,16 @@ struct MeterBar: View {
             displayedValue = clampedValue
         }
         .onChange(of: value) { _ in
-            withAnimation(.interactiveSpring(response: 0.55, dampingFraction: 0.86, blendDuration: 0.18)) {
+            if effectsEnabled {
+                withAnimation(.interactiveSpring(response: 0.55, dampingFraction: 0.86, blendDuration: 0.18)) {
+                    displayedValue = clampedValue
+                }
+            } else {
+                displayedValue = clampedValue
+            }
+        }
+        .onChange(of: effectsEnabled) { enabled in
+            if !enabled {
                 displayedValue = clampedValue
             }
         }

@@ -11,14 +11,28 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "StellarScope",
+            dependencies: ["StellarScopeNative"],
             resources: [
                 .process("Resources")
             ],
             linkerSettings: [
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("AppKit"),
+                .linkedFramework("CoreAudio"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("IOKit")
+            ]
+        ),
+        .target(
+            name: "StellarScopeNative",
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .unsafeFlags(["-std=c++17"])
+            ],
+            linkerSettings: [
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("IOKit"),
+                .linkedLibrary("IOReport")
             ]
         ),
         .executableTarget(

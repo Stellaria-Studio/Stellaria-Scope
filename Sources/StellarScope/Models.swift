@@ -54,6 +54,8 @@ struct SensorMetric: Identifiable, Hashable, Equatable {
             return String(format: "%.1f%%", number)
         case "rpm":
             return String(format: "%.0f rpm", number)
+        case "bpm":
+            return String(format: "%.0f bpm", number)
         case "px":
             return String(format: "%.0f", number)
         case "ch":

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private enum MonitorSection: String, CaseIterable, Identifiable, Hashable {
@@ -10,6 +11,7 @@ private enum MonitorSection: String, CaseIterable, Identifiable, Hashable {
     case audio = "Audio"
     case bus = "Bus & I/O"
     case environment = "Environment"
+    case sensorLab = "Sensor Lab"
     case sensors = "Sensors"
     case helperLogs = "Helper & Logs"
 
@@ -26,6 +28,7 @@ private enum MonitorSection: String, CaseIterable, Identifiable, Hashable {
         case .audio: return "speaker.wave.2"
         case .bus: return "cable.connector"
         case .environment: return "sensor"
+        case .sensorLab: return "sparkles"
         case .sensors: return "sensor"
         case .helperLogs: return "terminal"
         }
@@ -41,7 +44,8 @@ private enum MonitorSection: String, CaseIterable, Identifiable, Hashable {
         case .storage: return "Volumes, NVMe identity, free space and SMART state."
         case .audio: return "CoreAudio devices, defaults, sample rates and channel counts."
         case .bus: return "USB, Thunderbolt / USB4, PCI and network service inventory."
-        case .environment: return "Ambient light, motion, lid and SPU-exposed sensor state."
+        case .environment: return "Ambient light, lid state and SPU-exposed sensor metadata."
+        case .sensorLab: return "Exploratory Apple Silicon sensor toys and opt-in experiments."
         case .sensors: return "Dynamic catalog of every metric the helper can expose."
         case .helperLogs: return "Helper lifecycle, raw fields and diagnostics."
         }
@@ -49,20 +53,102 @@ private enum MonitorSection: String, CaseIterable, Identifiable, Hashable {
 }
 
 struct DashboardView: View {
-    @StateObject private var store = TelemetryStore()
+    @Environment(\.scenePhase) private var scenePhase
+    @EnvironmentObject private var store: TelemetryStore
     @StateObject private var helper = PrivilegedHelperController()
     @State private var section: MonitorSection? = .overview
-    @State private var preset: SamplingPreset = .live
+    @AppStorage("samplingPreset") private var samplingPresetID = SamplingPreset.live.rawValue
     @State private var sensorFilter = ""
     @State private var sensorCategory = "All"
     @State private var sensorSource = "All"
     @State private var onlyAvailable = true
     @State private var showRaw = false
+    @State private var appIsFrontmost = NSApp.isActive
+    @State private var windowIsActuallyVisible = true
+    @AppStorage("bcgHeartRateEnabled") private var bcgHeartRateEnabled = false
+    @AppStorage("pythonAdvancedBackendEnabled") private var pythonAdvancedBackendEnabled = false
+    @AppStorage("displayRefreshMeasurementEnabled") private var displayRefreshMeasurementEnabled = false
 
     private var snapshot: SystemSnapshot { store.snapshot }
     private var sensors: [SensorMetric] { snapshot.powermetrics.sensors }
+    private var activePreset: SamplingPreset { SamplingPreset(rawValue: samplingPresetID) ?? .live }
+    private var panelVisible: Bool { scenePhase == .active && appIsFrontmost && windowIsActuallyVisible }
+
+    private var samplingPresetBinding: Binding<SamplingPreset> {
+        Binding {
+            activePreset
+        } set: { preset in
+            samplingPresetID = preset.rawValue
+            store.setPreset(preset)
+        }
+    }
+
+    private var bcgHeartRateBinding: Binding<Bool> {
+        Binding {
+            pythonAdvancedBackendEnabled && bcgHeartRateEnabled
+        } set: { enabled in
+            bcgHeartRateEnabled = enabled
+            store.setBCGHeartRateEnabled(enabled)
+        }
+    }
+
+    private var displayRefreshMeasurementBinding: Binding<Bool> {
+        Binding {
+            displayRefreshMeasurementEnabled
+        } set: { enabled in
+            displayRefreshMeasurementEnabled = enabled
+            store.setDisplayRefreshMeasurementEnabled(enabled)
+        }
+    }
 
     var body: some View {
+        Group {
+            if panelVisible {
+                dashboardBody
+            } else {
+                inactiveBody
+            }
+        }
+        .environment(\.stellarRenderEffectsEnabled, panelVisible)
+        .onAppear {
+            refreshPanelVisibility()
+            updateTelemetryUIContext()
+        }
+        .onChange(of: section) { _ in
+            updateTelemetryUIContext()
+        }
+        .onChange(of: scenePhase) { _ in
+            refreshPanelVisibility()
+            updateTelemetryUIContext()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshPanelVisibility()
+            updateTelemetryUIContext()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            refreshPanelVisibility()
+            updateTelemetryUIContext()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { _ in
+            refreshPanelVisibility()
+            updateTelemetryUIContext()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didMiniaturizeNotification)) { _ in
+            refreshPanelVisibility()
+            updateTelemetryUIContext()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didDeminiaturizeNotification)) { _ in
+            refreshPanelVisibility()
+            updateTelemetryUIContext()
+        }
+        .frame(minWidth: 1080, minHeight: 760)
+        .onAppear {
+            store.setPreset(activePreset)
+            store.start()
+        }
+    }
+
+    private var dashboardBody: some View {
         NavigationSplitView {
             List(selection: $section) {
                 Section("Monitor") {
@@ -84,25 +170,29 @@ struct DashboardView: View {
             }
             .scrollIndicators(.visible)
             .background {
-                LinearGradient(
-                    colors: [
-                        Color(nsColor: .windowBackgroundColor),
-                        Color.accentColor.opacity(0.07),
-                        Color(nsColor: .windowBackgroundColor)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
+                if panelVisible {
+                    LinearGradient(
+                        colors: [
+                            Color(nsColor: .windowBackgroundColor),
+                            Color.accentColor.opacity(0.07),
+                            Color(nsColor: .windowBackgroundColor)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .ignoresSafeArea()
+                } else {
+                    Color(nsColor: .windowBackgroundColor)
+                        .ignoresSafeArea()
+                }
             }
-            .toolbar {
+        .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
-                    Picker("Sampling", selection: $preset) {
+                    Picker("Sampling", selection: samplingPresetBinding) {
                         ForEach(SamplingPreset.allCases) { p in Text(p.rawValue).tag(p) }
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 260)
-                    .onChange(of: preset, perform: { store.setPreset($0) })
 
                     Button { helper.refreshDiagnosis() } label: {
                         Label("Check", systemImage: "stethoscope")
@@ -110,12 +200,11 @@ struct DashboardView: View {
                 }
             }
         }
-        .frame(minWidth: 1080, minHeight: 760)
-        .onAppear {
-            store.setPreset(preset)
-            store.start()
-        }
-        .onDisappear { store.stop() }
+    }
+
+    private var inactiveBody: some View {
+        Color(nsColor: .windowBackgroundColor)
+            .ignoresSafeArea()
     }
 
     @ViewBuilder
@@ -130,6 +219,7 @@ struct DashboardView: View {
         case .audio: audioPage
         case .bus: busPage
         case .environment: environmentPage
+        case .sensorLab: sensorLabPage
         case .sensors: sensorsPage
         case .helperLogs: helperLogsPage
         }
@@ -220,10 +310,10 @@ struct DashboardView: View {
                 MetricCard(title: "Thermal State", value: snapshot.thermal.label, subtitle: snapshot.powermetrics.thermalPressure ?? "ProcessInfo") {
                     MeterBar(value: Double(snapshot.thermal.rawValue) / 3.0)
                 }
-                MetricCard(title: "CPU Die", value: celsius(snapshot.powermetrics.cpuDieTemperatureC), subtitle: "macmon / helper") {
+                MetricCard(title: "CPU Die", value: celsius(snapshot.powermetrics.cpuDieTemperatureC), subtitle: "NativeSMC / fallback") {
                     MeterBar(value: min(1, (snapshot.powermetrics.cpuDieTemperatureC ?? 0) / 105.0))
                 }
-                MetricCard(title: "GPU Die", value: celsius(snapshot.powermetrics.gpuDieTemperatureC), subtitle: "macmon / helper") {
+                MetricCard(title: "GPU Die", value: celsius(snapshot.powermetrics.gpuDieTemperatureC), subtitle: "NativeSMC / fallback") {
                     MeterBar(value: min(1, (snapshot.powermetrics.gpuDieTemperatureC ?? 0) / 105.0))
                 }
                 MetricCard(title: "Fan RPM", value: rpm(snapshot.powermetrics.fanRPM), subtitle: fanStatusText) {
@@ -252,7 +342,7 @@ struct DashboardView: View {
                 MetricCard(title: "CPU Power", value: mw(snapshot.powermetrics.cpuPowerMW), subtitle: clusterPowerText) {
                     MeterBar(value: min(1, (snapshot.powermetrics.cpuPowerMW ?? 0) / 35_000))
                 }
-                MetricCard(title: "GPU Power", value: mw(snapshot.powermetrics.gpuPowerMW), subtitle: "GPU RAM \(sensorDisplay("macmon.gpu_ram_power_mw") ?? "—")") {
+                MetricCard(title: "GPU Power", value: mw(snapshot.powermetrics.gpuPowerMW), subtitle: "GPU RAM \(sensorDisplay("native.ioreport.gpu_sram_power_mw") ?? sensorDisplay("macmon.gpu_ram_power_mw") ?? "—")") {
                     MeterBar(value: min(1, (snapshot.powermetrics.gpuPowerMW ?? 0) / 35_000))
                 }
                 MetricCard(title: "System Input", value: sensorDisplay("system.input_power_mw") ?? "—", subtitle: sensorDisplay("adapter.watts").map { "adapter \($0)" } ?? "adapter —") {
@@ -300,16 +390,29 @@ struct DashboardView: View {
             }
 
             SectionBox(title: "Primary Display", subtitle: "Resolution, mode, connection and panel state.") {
-                adaptiveKeyValues([
-                    ("Name", sensorDisplay("display.0.name") ?? "—"),
-                    ("Physical pixels", displayResolutionText),
-                    ("Logical mode", "\(sensorDisplay("display.0.logical_width_px") ?? "—") x \(sensorDisplay("display.0.logical_height_px") ?? "—")"),
-                    ("Measured refresh", displayRefreshText),
-                    ("Mode refresh", sensorDisplay("display.0.refresh_hz") ?? hz(snapshot.displayRefresh.modeHz)),
-                    ("VRR range", displayVRRRangeText),
-                    ("Connection", sensorDisplay("display.0.connection") ?? "—"),
-                    ("Online / main", "\(sensorDisplay("display.0.online") ?? "—") / \(sensorDisplay("display.0.main") ?? "—")")
-                ])
+                VStack(alignment: .leading, spacing: 14) {
+                    Toggle(isOn: displayRefreshMeasurementBinding) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Measure live refresh")
+                                .font(.subheadline.weight(.semibold))
+                            Text("Uses short CVDisplayLink bursts; turn off when you do not need exact live Hz.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+
+                    adaptiveKeyValues([
+                        ("Name", sensorDisplay("display.0.name") ?? "—"),
+                        ("Physical pixels", displayResolutionText),
+                        ("Logical mode", "\(sensorDisplay("display.0.logical_width_px") ?? "—") x \(sensorDisplay("display.0.logical_height_px") ?? "—")"),
+                        ("Measured refresh", displayRefreshMeasurementEnabled ? displayRefreshText : "Off"),
+                        ("Mode refresh", sensorDisplay("display.0.refresh_hz") ?? hz(snapshot.displayRefresh.modeHz)),
+                        ("VRR range", displayVRRRangeText),
+                        ("Connection", sensorDisplay("display.0.connection") ?? "—"),
+                        ("Online / main", "\(sensorDisplay("display.0.online") ?? "—") / \(sensorDisplay("display.0.main") ?? "—")")
+                    ])
+                }
             }
 
             sensorStrip(categories: ["Display"], title: "Display Sensors")
@@ -419,8 +522,52 @@ struct DashboardView: View {
         VStack(alignment: .leading, spacing: 18) {
             helperUpgradeNotice
             LazyVGrid(columns: metricColumns(minimum: 220), spacing: 14) {
-                MetricCard(title: "Ambient Light", value: sensorDisplay("environment.ambient_lux") ?? "—", subtitle: sensorDisplay("environment.als_transport") ?? "ALS sensor") {
-                    MeterBar(value: min(1, (numberSensor("environment.ambient_lux") ?? 0) / 1000.0))
+                MetricCard(title: "Ambient Light", value: sensorDisplay("environment.spu_ambient_lux") ?? sensorDisplay("environment.ambient_lux") ?? "—", subtitle: sensorDisplay("environment.als_transport") ?? "SPU / ALS sensor") {
+                    MeterBar(value: min(1, (numberSensor("environment.spu_ambient_lux") ?? numberSensor("environment.ambient_lux") ?? 0) / 1000.0))
+                }
+                MetricCard(title: "Lid / Hall", value: sensorDisplay("motion.lid_angle_degrees") ?? sensorDisplay("environment.clamshell_closed") ?? "—", subtitle: sensorDisplay("motion.hall.model") ?? "hall sensor") {
+                    MeterBar(value: (sensorDisplay("environment.clamshell_closed") == "yes") ? 1 : 0)
+                }
+                MetricCard(title: "Wake", value: sensorDisplay("environment.wake_reason") ?? "—", subtitle: "IOPM root domain") {
+                    StatusBadge(text: sensorDisplay("environment.clamshell_closed") ?? "clamshell —", systemImage: "power")
+                }
+            }
+
+            SectionBox(title: "Environment", subtitle: "Low-rate ambient light and power-domain state from SPU/ALS/IOPM services.") {
+                adaptiveKeyValues([
+                    ("Ambient lux", sensorDisplay("environment.spu_ambient_lux") ?? sensorDisplay("environment.ambient_lux") ?? "—"),
+                    ("ALS events", sensorDisplay("environment.als_events") ?? "—"),
+                    ("Lid angle", sensorDisplay("motion.lid_angle_degrees") ?? "—"),
+                    ("Clamshell closed", sensorDisplay("environment.clamshell_closed") ?? "—"),
+                    ("Clamshell causes sleep", sensorDisplay("environment.clamshell_causes_sleep") ?? "—"),
+                    ("Wake reason", sensorDisplay("environment.wake_reason") ?? "—")
+                ])
+            }
+
+            sensorStrip(categories: ["Environment"], title: "Environment Sensors")
+        }
+    }
+
+    private var sensorLabPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            helperUpgradeNotice
+            SectionBox(title: "Experiment Bench", subtitle: "Low-rate readings record continuously here. Turn on BCG only when you want a short high-rate motion experiment.") {
+                LazyVGrid(columns: metricColumns(minimum: 210), spacing: 14) {
+                    labTraceCard(title: "Lid Angle", value: sensorDisplay("motion.lid_angle_degrees") ?? "—", values: store.lidAngleHistory, systemImage: "laptopcomputer")
+                    labTraceCard(title: "Ambient Lux", value: sensorDisplay("environment.spu_ambient_lux") ?? "—", values: store.ambientLightHistory, systemImage: "sun.max")
+                    labTraceCard(title: "ALS Chroma 0", value: sensorDisplay("environment.als_chroma_0") ?? "—", values: chromaHistory(0), systemImage: "eyedropper")
+                    labTraceCard(title: "ALS Chroma 1", value: sensorDisplay("environment.als_chroma_1") ?? "—", values: chromaHistory(1), systemImage: "eyedropper.halffull")
+                    labTraceCard(title: "ALS Chroma 2", value: sensorDisplay("environment.als_chroma_2") ?? "—", values: chromaHistory(2), systemImage: "circle.hexagongrid")
+                    labTraceCard(title: "BCG BPM", value: bcgHeartRateValue, values: store.bcgHeartRateHistory, systemImage: "heart.text.square")
+                }
+            }
+
+            LazyVGrid(columns: metricColumns(minimum: 220), spacing: 14) {
+                MetricCard(title: "Lid Angle", value: sensorDisplay("motion.lid_angle_degrees") ?? "—", subtitle: "SPU HID snapshot") {
+                    MeterBar(value: min(1, (numberSensor("motion.lid_angle_degrees") ?? 0) / 135.0))
+                }
+                MetricCard(title: "Light Color", value: sensorDisplay("environment.spu_ambient_lux") ?? "—", subtitle: alsColorChannelText) {
+                    MeterBar(value: min(1, (numberSensor("environment.spu_ambient_lux") ?? 0) / 1000.0))
                 }
                 MetricCard(title: "Accelerometer", value: sensorDisplay("motion.accelerometer.available") ?? "—", subtitle: sensorDisplay("motion.accelerometer.model") ?? "model —") {
                     StatusBadge(text: sensorDisplay("motion.accelerometer.rates") ?? "rates —", systemImage: "move.3d")
@@ -428,25 +575,44 @@ struct DashboardView: View {
                 MetricCard(title: "Gyroscope", value: sensorDisplay("motion.gyroscope.available") ?? "—", subtitle: sensorDisplay("motion.gyroscope.model") ?? "model —") {
                     StatusBadge(text: sensorDisplay("motion.gyroscope.rates") ?? "rates —", systemImage: "gyroscope")
                 }
-                MetricCard(title: "Lid / Hall", value: sensorDisplay("environment.clamshell_closed") ?? "—", subtitle: sensorDisplay("motion.hall.model") ?? "hall sensor") {
-                    MeterBar(value: (sensorDisplay("environment.clamshell_closed") == "yes") ? 1 : 0)
+                MetricCard(title: "BCG Heart Rate", value: bcgHeartRateValue, subtitle: bcgHeartRateStatus) {
+                    HStack(spacing: 10) {
+                        Toggle("BCG", isOn: bcgHeartRateBinding)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .disabled(!pythonAdvancedBackendEnabled)
+                        Text("High-rate; turn off after testing to save power")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(bcgHeartRateEnabled ? .orange : .secondary)
+                            .lineLimit(2)
+                    }
                 }
             }
 
-            SectionBox(title: "Environment & Motion", subtitle: "Values are read from SPU/ALS/IOPM services. Raw motion axes may be privacy-gated; this page shows exposed state and counters.") {
+            SectionBox(title: "Experiment Log", subtitle: "Raw state from the helper, useful while trying odd sensor behaviors.") {
                 adaptiveKeyValues([
-                    ("Ambient lux", sensorDisplay("environment.ambient_lux") ?? "—"),
-                    ("ALS events", sensorDisplay("environment.als_events") ?? "—"),
+                    ("ALS color channels", alsColorChannelText),
+                    ("ALS chroma", [
+                        sensorDisplay("environment.als_chroma_0") ?? "—",
+                        sensorDisplay("environment.als_chroma_1") ?? "—",
+                        sensorDisplay("environment.als_chroma_2") ?? "—",
+                        sensorDisplay("environment.als_chroma_3") ?? "—"
+                    ].joined(separator: " / ")),
                     ("Accelerometer model", sensorDisplay("motion.accelerometer.model") ?? "—"),
                     ("Accelerometer events", sensorDisplay("motion.accelerometer.events") ?? "—"),
                     ("Gyroscope model", sensorDisplay("motion.gyroscope.model") ?? "—"),
                     ("Gyroscope events", sensorDisplay("motion.gyroscope.events") ?? "—"),
-                    ("Hall model", sensorDisplay("motion.hall.model") ?? "—"),
-                    ("Wake reason", sensorDisplay("environment.wake_reason") ?? "—")
+                    ("Lid angle", sensorDisplay("motion.lid_angle_degrees") ?? "—"),
+                    ("BCG heart-rate", sensorDisplay("motion.bcg_heart_rate_bpm") ?? bcgHeartRateStatus),
+                    ("BCG samples", rawValue("spu_hid.bcg_samples") ?? "—"),
+                    ("BCG confidence", rawValue("spu_hid.bcg_confidence") ?? "—"),
+                    ("SPU HID devices", rawValue("spu_hid.device_count") ?? "—"),
+                    ("Helper schema", rawValue("agent.schema_version") ?? "—"),
+                    ("Attribution", rawValue("spu_hid.attribution") ?? "apple-silicon-accelerometer / MIT")
                 ])
             }
 
-            sensorStrip(categories: ["Environment", "Motion"], title: "Environment Sensors")
+            sensorStrip(categories: ["Motion", "Color"], title: "Sensor Lab Catalog")
         }
     }
 
@@ -504,10 +670,26 @@ struct DashboardView: View {
     }
 
     private func helperControls(compact: Bool) -> some View {
-        SectionBox(title: "Advanced Helper", subtitle: "LaunchDaemon sampler; the app only reads /tmp JSON and logs.") {
+        SectionBox(title: "Backends", subtitle: "Native realtime runs in-app; Python remains optional for powermetrics/macmon fallback and experimental BCG.") {
             VStack(alignment: .leading, spacing: 12) {
+                Toggle(isOn: pythonBackendBinding) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Python Advanced Backend")
+                            .font(.subheadline.weight(.semibold))
+                        Text("Optional LaunchDaemon JSON backend for counters still hidden from native IOReport/SMC on this macOS build and BCG experiments.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
                 HStack(spacing: 10) {
-                    Button { helper.start(intervalMS: Int(preset.interval * 1000)) } label: {
+                    Button { helper.update(intervalMS: activePreset.helperIntervalMS) } label: {
+                        Label("Update Helper", systemImage: "arrow.down.doc")
+                    }
+                    .disabled(helper.isBusy)
+
+                    Button { helper.start(intervalMS: activePreset.helperIntervalMS) } label: {
                         Label("Start", systemImage: "lock.open")
                     }
                     .disabled(helper.isBusy)
@@ -526,7 +708,7 @@ struct DashboardView: View {
                     }
                 }
 
-                Text(helper.status)
+                Text(helperStatusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -546,14 +728,16 @@ struct DashboardView: View {
 
                 if !compact {
                     adaptiveKeyValues([
-                        ("UI interval", String(format: "%.2fs", preset.interval)),
-                        ("Advanced interval", String(format: "%.2fs", Double(preset.helperIntervalMS) / 1000.0)),
-                        ("Helper schema", rawValue("agent.schema_version") ?? "old / unknown"),
-                        ("Helper profile", rawValue("agent.profile") ?? preset.profileName),
+                        ("UI interval", String(format: "%.2fs", activePreset.interval)),
+                        ("Advanced interval", String(format: "%.2fs", Double(activePreset.helperIntervalMS) / 1000.0)),
+                        ("Running helper schema", runningHelperSchemaText),
+                        ("Bundled helper schema", bundledHelperSchemaText),
+                        ("Helper profile", rawValue("agent.profile") ?? activePreset.profileName),
                         ("Control file", rawValue("agent.control_path") ?? "/tmp/stellarscope-control.json"),
                         ("CPU source", "Mach host_processor_info"),
                         ("Memory source", "host_statistics64 + vm.swapusage"),
-                        ("Advanced source", "macmon / powermetrics / IORegistry / system_profiler / SMC probe")
+                        ("Native advanced", "IOReport energy/frequency + AppleSMC fan + PMGR DVFS"),
+                        ("Optional fallback", "macmon / powermetrics / system_profiler / Python BCG")
                     ])
                 }
             }
@@ -562,15 +746,15 @@ struct DashboardView: View {
 
     @ViewBuilder
     private var helperUpgradeNotice: some View {
-        if helperNeedsRestartForExtendedPanels {
-            SectionBox(title: "Helper Restart Required", subtitle: "The app UI is newer than the running LaunchDaemon helper, so these panels are still reading the old JSON schema.") {
+        if helperNeedsManualUpdate || helperNeedsRestartForExtendedPanels {
+            SectionBox(title: "Helper Restart Required", subtitle: "The app UI is newer than the running LaunchDaemon helper, so Sensor Lab and newer panels are still reading an old JSON schema.") {
                 HStack(spacing: 12) {
-                    Button { helper.start(intervalMS: preset.helperIntervalMS) } label: {
-                        Label("Restart Advanced Helper", systemImage: "arrow.clockwise")
+                    Button { helper.update(intervalMS: activePreset.helperIntervalMS) } label: {
+                        Label("Update Helper", systemImage: "arrow.down.doc")
                     }
                     .disabled(helper.isBusy)
 
-                    Text("After the administrator prompt, Display / Storage / Audio / Bus sensors will populate on the next samples.")
+                    Text("After the administrator prompt, StellarScope reinstalls the bundled helper, restarts the LaunchDaemon, then returns it to standby if Python Advanced Backend is off.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -599,6 +783,43 @@ struct DashboardView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+    }
+
+    private func labTraceCard(title: String, value: String, values: [Double], systemImage: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(title, systemImage: systemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(value)
+                    .font(.title3.monospacedDigit().weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(.black.opacity(0.16))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(.white.opacity(0.08), lineWidth: 1)
+                    )
+                if values.count > 1 {
+                    SparklineView(values: values, lineWidth: 2)
+                        .padding(8)
+                } else {
+                    Text("waiting")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(height: 54)
+            Text("\(values.count) samples")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .stellarGlassSurface(radius: 12)
     }
 
     private var filteredRawRows: [RawMetric] {
@@ -632,14 +853,60 @@ struct DashboardView: View {
         sensors.filter { $0.value != "—" }
     }
 
+    private var alsColorChannelText: String {
+        [
+            sensorDisplay("environment.als_color_channel_0") ?? "—",
+            sensorDisplay("environment.als_color_channel_1") ?? "—",
+            sensorDisplay("environment.als_color_channel_2") ?? "—",
+            sensorDisplay("environment.als_color_channel_3") ?? "—"
+        ].joined(separator: " / ")
+    }
+
+    private func chromaHistory(_ index: Int) -> [Double] {
+        guard store.alsChromaHistories.indices.contains(index) else { return [] }
+        return store.alsChromaHistories[index]
+    }
+
     private var experimentalSensors: [SensorMetric] {
         sensors.filter(\.isExperimental)
     }
 
     private var helperNeedsRestartForExtendedPanels: Bool {
+        guard pythonAdvancedBackendEnabled else { return false }
         guard snapshot.powermetrics.available else { return false }
         let schema = numberRaw("agent.schema_version") ?? 0
-        return schema < 5 && !hasExtendedPanelSensors
+        return schema < 8 || (schema < 5 && !hasExtendedPanelSensors)
+    }
+
+    private var helperNeedsManualUpdate: Bool {
+        guard let running = PrivilegedHelperLauncher.runningAgentSchemaVersion(),
+              let bundled = PrivilegedHelperLauncher.bundledAgentSchemaVersion() else {
+            return false
+        }
+        return running < bundled
+    }
+
+    private var runningHelperSchemaText: String {
+        if let running = PrivilegedHelperLauncher.runningAgentSchemaVersion() {
+            return "\(running)"
+        }
+        return rawValue("agent.schema_version") ?? "unknown"
+    }
+
+    private var bundledHelperSchemaText: String {
+        PrivilegedHelperLauncher.bundledAgentSchemaVersion().map(String.init) ?? "unknown"
+    }
+
+    private var helperStatusText: String {
+        if helperNeedsManualUpdate {
+            return helper.status == "Advanced helper not started."
+                ? "Running LaunchDaemon helper is older than this app. Use Update Helper to reinstall and restart it safely."
+                : helper.status
+        }
+        if pythonAdvancedBackendEnabled {
+            return helper.status
+        }
+        return "\(helper.status) Native realtime backend is active; Python backend is off and the helper stays in standby."
     }
 
     private var hasExtendedPanelSensors: Bool {
@@ -647,13 +914,63 @@ struct DashboardView: View {
     }
 
     private var feedStatusText: String {
+        if !pythonAdvancedBackendEnabled { return "Native realtime" }
         if helperNeedsRestartForExtendedPanels { return "Restart helper for new panels" }
         return snapshot.powermetrics.available ? "Advanced feed live" : "Advanced feed waiting"
     }
 
     private var feedStatusIcon: String {
+        if !pythonAdvancedBackendEnabled { return "sensor.fill" }
         if helperNeedsRestartForExtendedPanels { return "arrow.clockwise.circle.fill" }
         return snapshot.powermetrics.available ? "checkmark.circle.fill" : "clock"
+    }
+
+    private var pythonBackendBinding: Binding<Bool> {
+        Binding {
+            pythonAdvancedBackendEnabled
+        } set: { enabled in
+            pythonAdvancedBackendEnabled = enabled
+            store.setPythonAdvancedBackendEnabled(enabled)
+            if enabled {
+                helper.refreshDiagnosis()
+            }
+        }
+    }
+
+    private func updateTelemetryUIContext() {
+        store.setUIContext(sectionID: (section ?? .overview).rawValue, appIsActive: panelVisible)
+    }
+
+    private func refreshPanelVisibility() {
+        appIsFrontmost = NSApp.isActive
+        windowIsActuallyVisible = NSApp.windows.contains { window in
+            guard window.isVisible, !window.isMiniaturized else { return false }
+            guard window.isKeyWindow || window.isMainWindow else { return false }
+            guard window.contentViewController is NSHostingController<DashboardView>
+                    || window.title.localizedCaseInsensitiveContains("StellarScope")
+                    || window.title.isEmpty else {
+                return false
+            }
+            return window.occlusionState.contains(.visible)
+        }
+    }
+
+    private var bcgHeartRateValue: String {
+        guard pythonAdvancedBackendEnabled else { return "Off" }
+        if let bpm = sensorDisplay("motion.bcg_heart_rate_bpm") { return bpm }
+        return bcgHeartRateEnabled ? "— bpm" : "Off"
+    }
+
+    private var bcgHeartRateStatus: String {
+        guard pythonAdvancedBackendEnabled else { return "requires Python backend" }
+        let status = sensorDisplay("motion.bcg_heart_rate_status") ?? rawValue("spu_hid.bcg_status")
+        guard bcgHeartRateEnabled else {
+            return status ?? "disabled for low-power monitoring"
+        }
+        if let status, !status.localizedCaseInsensitiveContains("disabled") {
+            return status
+        }
+        return "sampling high-rate motion"
     }
 
     private func sensorDisplay(_ id: String) -> String? {
@@ -715,6 +1032,7 @@ struct DashboardView: View {
     }
 
     private var displayRefreshSubtitle: String {
+        if !displayRefreshMeasurementEnabled { return "measurement off" }
         if snapshot.displayRefresh.measuredHz != nil { return "CVDisplayLink measured" }
         if snapshot.displayRefresh.modeHz != nil { return "mode refresh" }
         return "waiting for display link"
@@ -865,6 +1183,7 @@ private struct SensorTableView: View {
         case "Display": return "display"
         case "Environment": return "sun.max"
         case "Motion": return "move.3d"
+        case "Color": return "eyedropper"
         default: return "sensor"
         }
     }
