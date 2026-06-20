@@ -85,8 +85,13 @@ struct DashboardView: View {
 
     private var bcgHeartRateBinding: Binding<Bool> {
         Binding {
-            pythonAdvancedBackendEnabled && bcgHeartRateEnabled
+            bcgHeartRateEnabled
         } set: { enabled in
+            if enabled {
+                enableBCGExperiment()
+            } else {
+                helper.refreshDiagnosis()
+            }
             bcgHeartRateEnabled = enabled
             store.setBCGHeartRateEnabled(enabled)
         }
@@ -580,7 +585,6 @@ struct DashboardView: View {
                         Toggle("BCG", isOn: bcgHeartRateBinding)
                             .labelsHidden()
                             .toggleStyle(.switch)
-                            .disabled(!pythonAdvancedBackendEnabled)
                         Text("High-rate; turn off after testing to save power")
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(bcgHeartRateEnabled ? .orange : .secondary)
@@ -937,6 +941,18 @@ struct DashboardView: View {
         }
     }
 
+    private func enableBCGExperiment() {
+        if !pythonAdvancedBackendEnabled {
+            pythonAdvancedBackendEnabled = true
+            store.setPythonAdvancedBackendEnabled(true)
+        }
+        if PrivilegedHelperLauncher.helperNeedsInstallOrRestart() {
+            helper.start(intervalMS: min(activePreset.helperIntervalMS, 2_000))
+        } else {
+            helper.refreshDiagnosis()
+        }
+    }
+
     private func updateTelemetryUIContext() {
         store.setUIContext(sectionID: (section ?? .overview).rawValue, appIsActive: panelVisible)
     }
@@ -956,13 +972,17 @@ struct DashboardView: View {
     }
 
     private var bcgHeartRateValue: String {
-        guard pythonAdvancedBackendEnabled else { return "Off" }
         if let bpm = sensorDisplay("motion.bcg_heart_rate_bpm") { return bpm }
         return bcgHeartRateEnabled ? "— bpm" : "Off"
     }
 
     private var bcgHeartRateStatus: String {
-        guard pythonAdvancedBackendEnabled else { return "requires Python backend" }
+        if bcgHeartRateEnabled && !pythonAdvancedBackendEnabled {
+            return "starting Python BCG helper"
+        }
+        if bcgHeartRateEnabled && helper.isBusy {
+            return "requesting helper access"
+        }
         let status = sensorDisplay("motion.bcg_heart_rate_status") ?? rawValue("spu_hid.bcg_status")
         guard bcgHeartRateEnabled else {
             return status ?? "disabled for low-power monitoring"

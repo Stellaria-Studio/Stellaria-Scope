@@ -127,9 +127,9 @@ readings.
 
 High-rate accelerometer/gyroscope streaming and BCG heart-rate detection are not
 enabled by default because they keep the SPU active. The Sensor Lab page exposes
-a separate BCG heart-rate opt-in switch, currently backed by the optional Python
-advanced backend, so this path is explicit rather than silently running in the
-background.
+a separate BCG heart-rate opt-in switch. Turning it on automatically enables the
+Python advanced backend and starts the bundled LaunchDaemon helper when needed;
+turn it off after short experiments to return to low-power monitoring.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for MIT attribution to the
 apple-silicon-accelerometer project that documented these report formats.
