@@ -1,0 +1,43 @@
+[
+  {
+    "id": "project-architecture",
+    "name": "Stellaria-Scope architecture",
+    "aliases": [
+      "Stellaria-Scope",
+      "Scope",
+      "架构",
+      "职责"
+    ],
+    "intent": "Native SwiftUI Apple Silicon system monitor with Liquid Glass dashboard and dynamic sensors",
+    "qualification": "DECLARED_PROJECT_KNOWLEDGE",
+    "invariants": [
+      "Source and project contracts remain authoritative; declared capabilities need matching execution evidence."
+    ],
+    "implementationPaths": [
+      "Sources",
+      "scripts"
+    ],
+    "dependsOn": [],
+    "acceptanceGates": [
+      "source identity",
+      "declared validation is not execution evidence"
+    ],
+    "sources": [
+      {
+        "path": "README.md",
+        "line": 1,
+        "commit": "95a32482ef459e345fce1c4b7ddeb64ba7cc63c8"
+      }
+    ],
+    "validation": [
+      "python3 -B Tests/test_powermetrics_agent.py"
+    ],
+    "validationSources": [
+      {
+        "path": "README.md",
+        "line": 141,
+        "commit": "95a32482ef459e345fce1c4b7ddeb64ba7cc63c8"
+      }
+    ]
+  }
+]

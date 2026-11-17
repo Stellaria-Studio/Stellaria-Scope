@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "name": "Stellaria-Scope",
+  "components": {
+    "project": {
+      "description": "Native SwiftUI Apple Silicon system monitor with Liquid Glass dashboard and dynamic sensors",
+      "paths": [
+        "Sources",
+        "scripts"
+      ],
+      "approved": [
+        "README.md"
+      ],
+      "required_files": [
+        "README.md"
+      ],
+      "build_targets": [],
+      "validation": [],
+      "pitfalls": [
+        "Source and project contracts remain authoritative; declared capabilities need matching execution evidence."
+      ],
+      "evidence": []
+    }
+  },
+  "build_metadata": [
+    "Package.swift"
+  ]
+}
