@@ -15,7 +15,8 @@
     ],
     "implementationPaths": [
       "Sources",
-      "scripts"
+      "scripts",
+      "Package.swift"
     ],
     "dependsOn": [],
     "acceptanceGates": [
